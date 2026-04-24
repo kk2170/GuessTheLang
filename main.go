@@ -2,14 +2,19 @@ package main
 
 import (
 	"bufio"
+	_ "embed"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
+	"hash/fnv"
 	"io"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 type Answer int
@@ -20,16 +25,30 @@ const (
 	No
 )
 
+const builtInCatalogID = "programming-languages"
+
 type Feature struct {
 	Key    string
 	Label  string
 	Prompt string
 }
 
+type Question = Feature
+
 type Language struct {
 	Name     string
 	Summary  string
 	Features map[string]bool
+}
+
+type Entry = Language
+
+type Catalog struct {
+	ID        string
+	Title     string
+	Intro     string
+	Questions []Question
+	Entries   []Entry
 }
 
 type persistedLanguage struct {
@@ -38,8 +57,24 @@ type persistedLanguage struct {
 	Features []string `json:"features"`
 }
 
+type persistedQuestion struct {
+	Key    string `json:"key"`
+	Label  string `json:"label"`
+	Prompt string `json:"prompt"`
+}
+
+type catalogFile struct {
+	ID        string              `json:"id,omitempty"`
+	Title     string              `json:"title"`
+	Intro     string              `json:"intro"`
+	Questions []persistedQuestion `json:"questions"`
+	Entries   []persistedLanguage `json:"entries,omitempty"`
+	Languages []persistedLanguage `json:"languages,omitempty"`
+}
+
 type knowledgeFile struct {
-	Languages []persistedLanguage `json:"languages"`
+	Entries   []persistedLanguage `json:"entries,omitempty"`
+	Languages []persistedLanguage `json:"languages,omitempty"`
 }
 
 type Match struct {
@@ -49,126 +84,183 @@ type Match struct {
 	Coverage   int
 }
 
+type randomizer interface {
+	Intn(n int) int
+}
+
 type Game struct {
-	languages     []Language
-	learned       []Language
+	catalog       Catalog
+	entries       []Entry
+	learned       []Entry
 	answers       map[string]Answer
 	knowledgePath string
+	rng           randomizer
 }
 
-var features = []Feature{
-	{Key: "static_typing", Label: "静的型付け", Prompt: "静的型付けですか？"},
-	{Key: "compiled_native", Label: "ネイティブコンパイル", Prompt: "主にネイティブコードへコンパイルして使いますか？"},
-	{Key: "runs_on_jvm", Label: "JVM", Prompt: "JVM 上で動くことが多いですか？"},
-	{Key: "runs_on_dotnet", Label: ".NET", Prompt: ".NET ランタイム上で動くことが多いですか？"},
-	{Key: "browser_native", Label: "ブラウザ実行", Prompt: "ブラウザでそのまま動くことが多いですか？"},
-	{Key: "gc", Label: "GC", Prompt: "ガベージコレクションがありますか？"},
-	{Key: "manual_memory", Label: "手動メモリ管理", Prompt: "手動メモリ管理の印象が強いですか？"},
-	{Key: "ownership_model", Label: "所有権モデル", Prompt: "所有権や borrow checker が看板機能ですか？"},
-	{Key: "indentation_sensitive", Label: "インデント構文", Prompt: "インデントが構文の一部ですか？"},
-	{Key: "functional_first", Label: "関数型寄り", Prompt: "関数型の色がかなり強いですか？"},
-	{Key: "actor_model", Label: "Actor/軽量プロセス", Prompt: "Actor モデルや軽量プロセスの印象が強いですか？"},
-	{Key: "web_backend", Label: "Web バックエンド", Prompt: "Web バックエンドでよく使われますか？"},
-	{Key: "mobile_ui", Label: "モバイル開発", Prompt: "モバイルアプリ開発の印象が強いですか？"},
-	{Key: "apple_ecosystem", Label: "Apple エコシステム", Prompt: "Apple 系開発で存在感が大きいですか？"},
-	{Key: "superset_of_js", Label: "JavaScript 上位互換", Prompt: "JavaScript の上位互換として使われますか？"},
-	{Key: "dollar_variables", Label: "$ 変数", Prompt: "$variable のような記法をよく使いますか？"},
-	{Key: "null_safety_focus", Label: "null 安全性", Prompt: "null 安全性が強く打ち出されていますか？"},
-	{Key: "c_family_syntax", Label: "C 系の波括弧構文", Prompt: "C 系の波括弧構文ですか？"},
-	{Key: "oop_impression", Label: "クラスベース OOP", Prompt: "クラスベース OOP の印象が強いですか？"},
-	{Key: "lightweight_concurrency", Label: "軽量並行処理", Prompt: "軽量並行処理が看板機能の 1 つですか？"},
-	{Key: "shell_scripting", Label: "シェルスクリプト", Prompt: "シェルスクリプトとして使う印象が強いですか？"},
-	{Key: "lisp_syntax", Label: "Lisp 系構文", Prompt: "Lisp 系の括弧中心構文ですか？"},
-	{Key: "scientific_computing", Label: "科学技術計算", Prompt: "科学技術計算やデータ分析の印象が強いですか？"},
-}
+//go:embed catalogs/programming-languages.json
+var defaultCatalogJSON []byte
 
-var builtinLanguages = []Language{
-	language("Go", "シンプルな文法と goroutine による軽量並行処理が特徴です。", "static_typing", "compiled_native", "gc", "web_backend", "c_family_syntax", "lightweight_concurrency"),
-	language("Rust", "所有権モデルで安全性と性能を両立しやすい言語です。", "static_typing", "compiled_native", "ownership_model", "c_family_syntax"),
-	language("C", "低レベル制御と手動メモリ管理の印象が強い言語です。", "static_typing", "compiled_native", "manual_memory", "c_family_syntax"),
-	language("C++", "C 系の性能志向とクラスベース OOP を併せ持つ言語です。", "static_typing", "compiled_native", "manual_memory", "c_family_syntax", "oop_impression"),
-	language("Java", "JVM 上で動き、業務システムやバックエンドで定番の言語です。", "static_typing", "runs_on_jvm", "gc", "web_backend", "c_family_syntax", "oop_impression"),
-	language("C#", ".NET を中心に使われるクラスベース OOP の代表的な言語です。", "static_typing", "runs_on_dotnet", "gc", "c_family_syntax", "oop_impression"),
-	language("JavaScript", "ブラウザでそのまま動き、Web 開発の中心にいる言語です。", "browser_native", "gc", "web_backend", "c_family_syntax"),
-	language("TypeScript", "JavaScript の上位互換として使われる静的型付き言語です。", "static_typing", "browser_native", "gc", "web_backend", "superset_of_js", "c_family_syntax"),
-	language("Python", "読みやすさとインデント構文で知られる汎用言語です。", "gc", "web_backend", "indentation_sensitive", "oop_impression"),
-	language("Ruby", "書き味の良さと Web 開発の印象が強い動的言語です。", "gc", "web_backend", "oop_impression"),
-	language("PHP", "サーバーサイド Web との結びつきが強いスクリプト言語です。", "gc", "web_backend", "dollar_variables"),
-	language("Swift", "Apple 系開発で存在感が大きいネイティブ志向の言語です。", "static_typing", "compiled_native", "apple_ecosystem", "null_safety_focus", "c_family_syntax", "oop_impression"),
-	language("Kotlin", "JVM と Android の文脈で人気が高く、null 安全性も強い言語です。", "static_typing", "runs_on_jvm", "gc", "mobile_ui", "null_safety_focus", "c_family_syntax", "oop_impression"),
-	language("Haskell", "純粋関数型の色が強く、型システムでも知られる言語です。", "static_typing", "compiled_native", "gc", "functional_first"),
-	language("Scala", "JVM 上で動く関数型寄りのマルチパラダイム言語です。", "static_typing", "runs_on_jvm", "gc", "functional_first", "oop_impression"),
-	language("Elixir", "BEAM 上で動き、Actor モデルや軽量プロセスの印象が強い言語です。", "gc", "functional_first", "actor_model", "web_backend", "lightweight_concurrency"),
-	language("Dart", "Flutter 文脈でよく見かける、モバイル寄りの言語です。", "static_typing", "gc", "mobile_ui", "null_safety_focus", "c_family_syntax", "oop_impression"),
-	language("Bash", "コマンドライン自動化でよく使われるシェルスクリプト言語です。", "shell_scripting"),
-	language("PowerShell", "Windows や運用自動化で存在感がある .NET ベースのシェルです。", "runs_on_dotnet", "gc", "dollar_variables", "shell_scripting"),
-	language("Perl", "テキスト処理やスクリプト用途で知られる、$ 変数の印象が強い言語です。", "gc", "dollar_variables"),
-	language("Lua", "軽量で組み込み用途にもよく使われるスクリプト言語です。", "gc"),
-	language("Objective-C", "Apple 系開発で長く使われてきた C 拡張ベースの言語です。", "compiled_native", "apple_ecosystem", "c_family_syntax", "oop_impression"),
-	language("Clojure", "JVM 上で動く Lisp 系の関数型言語です。", "runs_on_jvm", "gc", "functional_first", "lisp_syntax"),
-	language("F#", ".NET 上で動く関数型寄りの言語です。", "runs_on_dotnet", "gc", "functional_first"),
-	language("R", "統計解析やデータ分析でよく使われる言語です。", "gc", "scientific_computing"),
-	language("Julia", "高速な数値計算や科学技術計算で注目される言語です。", "gc", "compiled_native", "scientific_computing"),
-	language("Nim", "Python 風の読みやすさとネイティブコンパイルを両立しやすい言語です。", "static_typing", "compiled_native", "indentation_sensitive"),
-	language("Fortran", "科学技術計算の歴史でとても著名なコンパイル言語です。", "compiled_native", "scientific_computing"),
-	language("COBOL", "業務システムの文脈で長い歴史を持つ著名な言語です。", "compiled_native"),
-	language("Ada", "安全性を重視した静的型付きコンパイル言語です。", "static_typing", "compiled_native"),
-	language("OCaml", "関数型寄りでネイティブコンパイルもできる言語です。", "static_typing", "compiled_native", "gc", "functional_first"),
-	language("Erlang", "BEAM 上で動き、Actor モデルと並行処理で知られる言語です。", "gc", "functional_first", "actor_model", "lightweight_concurrency"),
-	language("Common Lisp", "歴史ある Lisp 系の言語です。", "gc", "functional_first", "lisp_syntax"),
-	language("Scheme", "教育や研究でもよく登場する Lisp 系言語です。", "gc", "functional_first", "lisp_syntax"),
-	language("Visual Basic .NET", ".NET 上で動く Visual Basic 系の言語です。", "runs_on_dotnet", "gc", "oop_impression"),
-	language("MATLAB", "数値計算やデータ解析の文脈で著名な言語です。", "scientific_computing"),
-}
+var defaultCatalog = mustLoadBuiltInCatalog()
+
+var features = defaultCatalog.Questions
+
+var builtinLanguages = defaultCatalog.Entries
 
 func main() {
-	knowledgePath, err := defaultKnowledgePath()
-	if err != nil {
+	if err := runCLI(os.Args[1:], os.Stdin, os.Stdout, os.Stderr); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
+}
 
-	learned, err := loadLearnedLanguages(knowledgePath)
+func runCLI(args []string, in io.Reader, out, errOut io.Writer) error {
+	if len(args) > 0 && args[0] == "catalog" {
+		return runCatalogCommand(args[1:], out, errOut)
+	}
+	return runGuessCommand(args, in, out, errOut)
+}
+
+func runGuessCommand(args []string, in io.Reader, out, errOut io.Writer) error {
+	flags := newFlagSet("guess-the-lang", errOut)
+	catalogFlag := flags.String("catalog", "", "path to catalog JSON")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+
+	catalogPath := resolveCatalogPath(*catalogFlag)
+	catalog, err := loadCatalog(catalogPath)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		os.Exit(1)
+		return err
+	}
+
+	knowledgePath, err := defaultKnowledgePath(catalog, catalogPath)
+	if err != nil {
+		return err
+	}
+
+	learned, err := loadLearnedEntries(knowledgePath)
+	if err != nil {
+		return err
 	}
 
 	game := Game{
-		languages:     mergeLanguages(builtinLanguages, learned),
+		catalog:       catalog,
+		entries:       mergeEntries(catalog.Entries, learned),
 		learned:       learned,
 		answers:       make(map[string]Answer),
 		knowledgePath: knowledgePath,
+		rng:           rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 
-	if err := run(&game, os.Stdin, os.Stdout); err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		os.Exit(1)
+	return run(&game, in, out)
+}
+
+func runCatalogCommand(args []string, out, errOut io.Writer) error {
+	if len(args) == 0 {
+		return errors.New("usage: catalog <init|validate> ...")
 	}
+
+	switch args[0] {
+	case "init":
+		return runCatalogInit(args[1:], out, errOut)
+	case "validate":
+		return runCatalogValidate(args[1:], out, errOut)
+	default:
+		return fmt.Errorf("unknown catalog subcommand: %s", args[0])
+	}
+}
+
+func runCatalogInit(args []string, out, errOut io.Writer) error {
+	flags := newFlagSet("catalog init", errOut)
+	id := flags.String("id", "", "catalog id")
+	title := flags.String("title", "", "catalog title")
+	intro := flags.String("intro", "", "catalog intro")
+	force := flags.Bool("force", false, "overwrite existing file")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+
+	path := strings.TrimSpace(flags.Arg(0))
+	if path == "" {
+		return errors.New("usage: catalog init [--id ID] [--title TITLE] [--intro INTRO] [--force] <path>")
+	}
+
+	if !*force {
+		if _, err := os.Stat(path); err == nil {
+			return fmt.Errorf("catalog already exists: %s", path)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+
+	catalog := starterCatalog(path, *id, *title, *intro)
+	if err := validateCatalog(catalog); err != nil {
+		return err
+	}
+	if err := writeCatalog(path, catalog); err != nil {
+		return err
+	}
+
+	fmt.Fprintf(out, "starter catalog written: %s\n", path)
+	return nil
+}
+
+func runCatalogValidate(args []string, out, errOut io.Writer) error {
+	flags := newFlagSet("catalog validate", errOut)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+
+	path := strings.TrimSpace(flags.Arg(0))
+	if path == "" {
+		return errors.New("usage: catalog validate <path>")
+	}
+
+	catalog, err := loadCatalog(path)
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintf(out, "catalog is valid: %s\n", path)
+	if catalog.ID != "" {
+		fmt.Fprintf(out, "id: %s\n", catalog.ID)
+	}
+	fmt.Fprintf(out, "questions: %d\n", len(catalog.Questions))
+	fmt.Fprintf(out, "entries: %d\n", len(catalog.Entries))
+	return nil
+}
+
+func newFlagSet(name string, errOut io.Writer) *flag.FlagSet {
+	flags := flag.NewFlagSet(name, flag.ContinueOnError)
+	flags.SetOutput(errOut)
+	return flags
 }
 
 func run(game *Game, in io.Reader, out io.Writer) error {
 	reader := bufio.NewReader(in)
+	if game.rng == nil {
+		game.rng = rand.New(rand.NewSource(1))
+	}
 
-	fmt.Fprintln(out, "Guess The Lang")
-	fmt.Fprintln(out, "Yes / No で答えてください。分からない場合は ? でスキップできます。")
+	fmt.Fprintln(out, game.catalog.Title)
+	fmt.Fprintln(out, game.catalog.Intro)
 	if len(game.learned) > 0 {
-		fmt.Fprintf(out, "学習済みの追加言語: %d\n", len(game.learned))
+		fmt.Fprintf(out, "学習済みの追加項目: %d\n", len(game.learned))
 	}
 	fmt.Fprintln(out)
 
 	for {
-		remaining := remainingCandidates(game.languages, game.answers)
+		remaining := remainingCandidates(game.entries, game.answers)
 
 		switch len(remaining) {
 		case 0:
-			reportNoExactMatch(out, game.languages, game.answers)
+			reportNoExactMatch(out, game.catalog.Questions, game.entries, game.answers)
 			return offerLearning(reader, out, game)
 		case 1:
 			return finishSingleGuess(reader, out, game, remaining[0])
 		}
 
-		feature, ok := bestQuestion(remaining, game.answers)
+		feature, ok := bestQuestionFrom(game.catalog.Questions, remaining, game.answers, game.rng)
 		if !ok {
 			reportAmbiguousResult(out, remaining)
 			return offerLearning(reader, out, game)
@@ -187,7 +279,7 @@ func run(game *Game, in io.Reader, out io.Writer) error {
 	}
 }
 
-func defaultKnowledgePath() (string, error) {
+func defaultKnowledgePath(catalog Catalog, catalogPath string) (string, error) {
 	if override := strings.TrimSpace(os.Getenv("GUESS_THE_LANG_DATA")); override != "" {
 		return override, nil
 	}
@@ -197,10 +289,290 @@ func defaultKnowledgePath() (string, error) {
 		return "", err
 	}
 
+	if strings.TrimSpace(catalog.ID) == builtInCatalogID {
+		return filepath.Join(configDir, "guess-the-lang", "knowledge.json"), nil
+	}
+
+	if strings.TrimSpace(catalogPath) == "" {
+		return filepath.Join(configDir, "guess-the-lang", "knowledge.json"), nil
+	}
+
+	if strings.TrimSpace(catalog.ID) != "" {
+		return filepath.Join(configDir, "guess-the-lang", "knowledge-"+catalogIDStorageName(catalog.ID)+".json"), nil
+	}
+
+	if strings.TrimSpace(catalogPath) != "" {
+		return filepath.Join(configDir, "guess-the-lang", "knowledge-"+catalogStorageName(catalogPath)+".json"), nil
+	}
+
 	return filepath.Join(configDir, "guess-the-lang", "knowledge.json"), nil
 }
 
-func loadLearnedLanguages(path string) ([]Language, error) {
+func catalogIDStorageName(id string) string {
+	name := sanitizeStorageName(id)
+	if name == "" {
+		return "custom"
+	}
+	return name + "-" + shortTextHash(strings.TrimSpace(id))
+}
+
+func catalogStorageName(path string) string {
+	base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	name := sanitizeStorageName(base)
+	if name == "" {
+		name = "custom"
+	}
+	return name + "-" + shortPathHash(path)
+}
+
+func sanitizeStorageName(raw string) string {
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	if raw == "" {
+		return ""
+	}
+
+	var builder strings.Builder
+	lastDash := false
+	for _, r := range raw {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			builder.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash {
+			builder.WriteByte('-')
+			lastDash = true
+		}
+	}
+
+	return strings.Trim(builder.String(), "-")
+}
+
+func shortPathHash(path string) string {
+	resolved := path
+	if abs, err := filepath.Abs(path); err == nil {
+		resolved = abs
+	}
+	return shortTextHash(filepath.Clean(resolved))
+}
+
+func shortTextHash(value string) string {
+	hasher := fnv.New32a()
+	_, _ = hasher.Write([]byte(value))
+	return fmt.Sprintf("%08x", hasher.Sum32())
+}
+
+func resolveCatalogPath(flagValue string) string {
+	if override := strings.TrimSpace(flagValue); override != "" {
+		return override
+	}
+	return strings.TrimSpace(os.Getenv("GUESS_THE_LANG_CATALOG"))
+}
+
+func mustLoadBuiltInCatalog() Catalog {
+	catalog, err := loadCatalogBytes(defaultCatalogJSON)
+	if err != nil {
+		panic(err)
+	}
+	return catalog
+}
+
+func loadCatalog(path string) (Catalog, error) {
+	if strings.TrimSpace(path) == "" {
+		return defaultCatalog, nil
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return Catalog{}, err
+	}
+	return loadCatalogBytes(data)
+}
+
+func loadCatalogBytes(data []byte) (Catalog, error) {
+	var file catalogFile
+	if err := json.Unmarshal(data, &file); err != nil {
+		return Catalog{}, err
+	}
+
+	catalog := catalogFromFile(file)
+	if err := validateCatalog(catalog); err != nil {
+		return Catalog{}, err
+	}
+	return catalog, nil
+}
+
+func catalogFromFile(file catalogFile) Catalog {
+	questions := make([]Question, 0, len(file.Questions))
+	for _, question := range file.Questions {
+		questions = append(questions, Question{
+			Key:    strings.TrimSpace(question.Key),
+			Label:  strings.TrimSpace(question.Label),
+			Prompt: strings.TrimSpace(question.Prompt),
+		})
+	}
+
+	entries := file.Entries
+	if len(entries) == 0 {
+		entries = file.Languages
+	}
+
+	loadedEntries := make([]Entry, 0, len(entries))
+	for _, entry := range entries {
+		loadedEntries = append(loadedEntries, language(strings.TrimSpace(entry.Name), strings.TrimSpace(entry.Summary), normalizeFeatureKeys(entry.Features)...))
+	}
+
+	return Catalog{
+		ID:        strings.TrimSpace(file.ID),
+		Title:     strings.TrimSpace(file.Title),
+		Intro:     strings.TrimSpace(file.Intro),
+		Questions: questions,
+		Entries:   loadedEntries,
+	}
+}
+
+func normalizeFeatureKeys(keys []string) []string {
+	normalized := make([]string, 0, len(keys))
+	for _, key := range keys {
+		trimmed := strings.TrimSpace(key)
+		if trimmed != "" {
+			normalized = append(normalized, trimmed)
+		}
+	}
+	return normalized
+}
+
+func validateCatalog(catalog Catalog) error {
+	if catalog.ID != "" && sanitizeStorageName(catalog.ID) == "" {
+		return errors.New("catalog id must contain at least one letter or number")
+	}
+	if strings.TrimSpace(catalog.Title) == "" {
+		return errors.New("catalog title must not be empty")
+	}
+	if strings.TrimSpace(catalog.Intro) == "" {
+		return errors.New("catalog intro must not be empty")
+	}
+	if len(catalog.Questions) == 0 {
+		return errors.New("catalog must contain at least one question")
+	}
+	if len(catalog.Entries) == 0 {
+		return errors.New("catalog must contain at least one entry")
+	}
+
+	knownQuestions := make(map[string]struct{}, len(catalog.Questions))
+	for _, question := range catalog.Questions {
+		key := strings.TrimSpace(question.Key)
+		if key == "" {
+			return errors.New("catalog question key must not be empty")
+		}
+		if strings.TrimSpace(question.Label) == "" {
+			return fmt.Errorf("catalog question %s label must not be empty", key)
+		}
+		if strings.TrimSpace(question.Prompt) == "" {
+			return fmt.Errorf("catalog question %s prompt must not be empty", key)
+		}
+		if _, exists := knownQuestions[key]; exists {
+			return fmt.Errorf("duplicate catalog question key: %s", key)
+		}
+		knownQuestions[key] = struct{}{}
+	}
+
+	knownEntries := make(map[string]struct{}, len(catalog.Entries))
+	for _, entry := range catalog.Entries {
+		name := normalizeName(entry.Name)
+		if name == "" {
+			return errors.New("catalog entry name must not be empty")
+		}
+		if _, exists := knownEntries[name]; exists {
+			return fmt.Errorf("duplicate catalog entry: %s", entry.Name)
+		}
+		knownEntries[name] = struct{}{}
+
+		for key := range entry.Features {
+			if _, ok := knownQuestions[key]; !ok {
+				return fmt.Errorf("catalog entry %s uses unknown feature %s", entry.Name, key)
+			}
+		}
+	}
+
+	return nil
+}
+
+func starterCatalog(path string, id, title, intro string) Catalog {
+	derivedID := strings.TrimSpace(id)
+	if derivedID == "" {
+		derivedID = sanitizeStorageName(strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)))
+	}
+	if derivedID == "" {
+		derivedID = "new-catalog"
+	}
+
+	derivedTitle := strings.TrimSpace(title)
+	if derivedTitle == "" {
+		derivedTitle = "New Catalog"
+	}
+
+	derivedIntro := strings.TrimSpace(intro)
+	if derivedIntro == "" {
+		derivedIntro = "Yes / No で答えてください。分からない場合は ? でスキップできます。"
+	}
+
+	return Catalog{
+		ID:    derivedID,
+		Title: derivedTitle,
+		Intro: derivedIntro,
+		Questions: []Question{
+			{Key: "feature_a", Label: "特徴A", Prompt: "特徴Aですか？"},
+			{Key: "feature_b", Label: "特徴B", Prompt: "特徴Bですか？"},
+		},
+		Entries: []Entry{
+			language("Item A", "最初の候補です。", "feature_a"),
+			language("Item B", "2 番目の候補です。", "feature_b"),
+		},
+	}
+}
+
+func writeCatalog(path string, catalog Catalog) error {
+	file := catalogToFile(catalog)
+	data, err := json.MarshalIndent(file, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(data, '\n'), 0o644)
+}
+
+func catalogToFile(catalog Catalog) catalogFile {
+	questions := make([]persistedQuestion, 0, len(catalog.Questions))
+	for _, question := range catalog.Questions {
+		questions = append(questions, persistedQuestion{
+			Key:    question.Key,
+			Label:  question.Label,
+			Prompt: question.Prompt,
+		})
+	}
+
+	entries := make([]persistedLanguage, 0, len(catalog.Entries))
+	for _, entry := range sortedEntries(catalog.Entries) {
+		entries = append(entries, persistedLanguage{
+			Name:     entry.Name,
+			Summary:  entry.Summary,
+			Features: sortedFeatureKeys(entry.Features),
+		})
+	}
+
+	return catalogFile{
+		ID:        catalog.ID,
+		Title:     catalog.Title,
+		Intro:     catalog.Intro,
+		Questions: questions,
+		Entries:   entries,
+	}
+}
+
+func loadLearnedEntries(path string) ([]Entry, error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -213,18 +585,26 @@ func loadLearnedLanguages(path string) ([]Language, error) {
 	if err := json.Unmarshal(data, &file); err != nil {
 		return nil, err
 	}
-
-	languages := make([]Language, 0, len(file.Languages))
-	for _, learned := range file.Languages {
-		languages = append(languages, language(learned.Name, learned.Summary, learned.Features...))
+	entries := file.Entries
+	if len(entries) == 0 {
+		entries = file.Languages
 	}
 
-	return languages, nil
+	learnedEntries := make([]Entry, 0, len(entries))
+	for _, learned := range entries {
+		learnedEntries = append(learnedEntries, language(learned.Name, learned.Summary, learned.Features...))
+	}
+
+	return learnedEntries, nil
 }
 
-func saveLearnedLanguages(path string, learned []Language) error {
+func loadLearnedLanguages(path string) ([]Language, error) {
+	return loadLearnedEntries(path)
+}
+
+func saveLearnedEntries(path string, learned []Entry) error {
 	entries := make([]persistedLanguage, 0, len(learned))
-	for _, lang := range sortedLanguages(learned) {
+	for _, lang := range sortedEntries(learned) {
 		entries = append(entries, persistedLanguage{
 			Name:     lang.Name,
 			Summary:  lang.Summary,
@@ -232,7 +612,7 @@ func saveLearnedLanguages(path string, learned []Language) error {
 		})
 	}
 
-	data, err := json.MarshalIndent(knowledgeFile{Languages: entries}, "", "  ")
+	data, err := json.MarshalIndent(knowledgeFile{Entries: entries, Languages: entries}, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -244,12 +624,20 @@ func saveLearnedLanguages(path string, learned []Language) error {
 	return os.WriteFile(path, append(data, '\n'), 0o644)
 }
 
-func sortedLanguages(languages []Language) []Language {
-	cloned := append([]Language(nil), languages...)
+func saveLearnedLanguages(path string, learned []Language) error {
+	return saveLearnedEntries(path, learned)
+}
+
+func sortedEntries(entries []Entry) []Entry {
+	cloned := append([]Entry(nil), entries...)
 	sort.Slice(cloned, func(i, j int) bool {
 		return strings.ToLower(cloned[i].Name) < strings.ToLower(cloned[j].Name)
 	})
 	return cloned
+}
+
+func sortedLanguages(languages []Language) []Language {
+	return sortedEntries(languages)
 }
 
 func sortedFeatureKeys(features map[string]bool) []string {
@@ -263,17 +651,17 @@ func sortedFeatureKeys(features map[string]bool) []string {
 	return keys
 }
 
-func mergeLanguages(base []Language, learned []Language) []Language {
-	merged := make(map[string]Language, len(base)+len(learned))
+func mergeEntries(base []Entry, learned []Entry) []Entry {
+	merged := make(map[string]Entry, len(base)+len(learned))
 
 	for _, lang := range base {
-		merged[normalizeLanguageName(lang.Name)] = cloneLanguage(lang)
+		merged[normalizeName(lang.Name)] = cloneEntry(lang)
 	}
 	for _, lang := range learned {
-		merged[normalizeLanguageName(lang.Name)] = cloneLanguage(lang)
+		merged[normalizeName(lang.Name)] = cloneEntry(lang)
 	}
 
-	result := make([]Language, 0, len(merged))
+	result := make([]Entry, 0, len(merged))
 	for _, lang := range merged {
 		result = append(result, lang)
 	}
@@ -285,7 +673,11 @@ func mergeLanguages(base []Language, learned []Language) []Language {
 	return result
 }
 
-func cloneLanguage(lang Language) Language {
+func mergeLanguages(base []Language, learned []Language) []Language {
+	return mergeEntries(base, learned)
+}
+
+func cloneEntry(lang Entry) Entry {
 	features := make(map[string]bool, len(lang.Features))
 	for key, value := range lang.Features {
 		features[key] = value
@@ -298,14 +690,22 @@ func cloneLanguage(lang Language) Language {
 	}
 }
 
-func normalizeLanguageName(name string) string {
+func cloneLanguage(lang Language) Language {
+	return cloneEntry(lang)
+}
+
+func normalizeName(name string) string {
 	return strings.ToLower(strings.TrimSpace(name))
 }
 
-func finishSingleGuess(reader *bufio.Reader, out io.Writer, game *Game, candidate Language) error {
-	reportSingleGuess(out, candidate, game.answers)
+func normalizeLanguageName(name string) string {
+	return normalizeName(name)
+}
 
-	correct, err := askYesNo(reader, out, "この言語で合っていますか？")
+func finishSingleGuess(reader *bufio.Reader, out io.Writer, game *Game, candidate Language) error {
+	reportSingleGuess(out, game.catalog.Questions, candidate, game.answers)
+
+	correct, err := askYesNo(reader, out, "この候補で合っていますか？")
 	if err != nil {
 		if err == io.EOF {
 			fmt.Fprintln(out)
@@ -343,10 +743,10 @@ func learnLanguage(reader *bufio.Reader, out io.Writer, game *Game, guessedName 
 	if guessedName != "" {
 		fmt.Fprintf(out, "%s ではなかったのですね。学習させてください。\n", guessedName)
 	} else {
-		fmt.Fprintln(out, "正解の言語を学習させてください。")
+		fmt.Fprintln(out, "正解の項目を学習させてください。")
 	}
 
-	name, err := askText(reader, out, "正解の言語名を教えてください", false)
+	name, err := askText(reader, out, "正解の名前を教えてください", false)
 	if err != nil {
 		if err == io.EOF {
 			fmt.Fprintln(out)
@@ -355,8 +755,8 @@ func learnLanguage(reader *bufio.Reader, out io.Writer, game *Game, guessedName 
 		return err
 	}
 
-	if hasBuiltinLanguage(name) {
-		fmt.Fprintf(out, "%s は初期収録済みなので、新規学習としては保存しませんでした。\n", name)
+	if hasCatalogEntry(game.catalog.Entries, name) {
+		fmt.Fprintf(out, "%s は初期データに含まれているので、新規学習としては保存しませんでした。\n", name)
 		return nil
 	}
 
@@ -383,7 +783,7 @@ func learnLanguage(reader *bufio.Reader, out io.Writer, game *Game, guessedName 
 	}
 
 	if !stopAsking {
-		for _, feature := range features {
+		for _, feature := range game.catalog.Questions {
 			if _, alreadyKnown := game.answers[feature.Key]; alreadyKnown {
 				continue
 			}
@@ -412,37 +812,45 @@ func learnLanguage(reader *bufio.Reader, out io.Writer, game *Game, guessedName 
 }
 
 func rememberLearnedLanguage(game *Game, learned Language) error {
-	game.learned = upsertLanguage(game.learned, learned)
-	game.languages = mergeLanguages(builtinLanguages, game.learned)
-	return saveLearnedLanguages(game.knowledgePath, game.learned)
+	game.learned = upsertEntry(game.learned, learned)
+	game.entries = mergeEntries(game.catalog.Entries, game.learned)
+	return saveLearnedEntries(game.knowledgePath, game.learned)
 }
 
-func hasBuiltinLanguage(name string) bool {
-	needle := normalizeLanguageName(name)
-	for _, language := range builtinLanguages {
-		if normalizeLanguageName(language.Name) == needle {
+func hasCatalogEntry(entries []Entry, name string) bool {
+	needle := normalizeName(name)
+	for _, entry := range entries {
+		if normalizeName(entry.Name) == needle {
 			return true
 		}
 	}
 	return false
 }
 
-func upsertLanguage(languages []Language, candidate Language) []Language {
-	key := normalizeLanguageName(candidate.Name)
-	for i, language := range languages {
-		if normalizeLanguageName(language.Name) == key {
-			languages[i] = candidate
-			return languages
+func hasBuiltinLanguage(name string) bool {
+	return hasCatalogEntry(defaultCatalog.Entries, name)
+}
+
+func upsertEntry(entries []Entry, candidate Entry) []Entry {
+	key := normalizeName(candidate.Name)
+	for i, entry := range entries {
+		if normalizeName(entry.Name) == key {
+			entries[i] = candidate
+			return entries
 		}
 	}
-	return append(languages, candidate)
+	return append(entries, candidate)
+}
+
+func upsertLanguage(languages []Language, candidate Language) []Language {
+	return upsertEntry(languages, candidate)
 }
 
 func defaultSummary(name string, raw string) string {
 	if strings.TrimSpace(raw) != "" {
 		return strings.TrimSpace(raw)
 	}
-	return fmt.Sprintf("%s の特徴を学習して追加された言語です。", name)
+	return fmt.Sprintf("%s の特徴を学習して追加された項目です。", name)
 }
 
 func language(name, summary string, featureKeys ...string) Language {
@@ -561,11 +969,11 @@ func matchesAnswers(language Language, answers map[string]Answer) bool {
 	return true
 }
 
-func bestQuestion(candidates []Language, answers map[string]Answer) (Feature, bool) {
+func bestQuestionFrom(questions []Question, candidates []Entry, answers map[string]Answer, rng randomizer) (Question, bool) {
 	bestScore := -1
-	var selected Feature
+	bestFeatures := make([]Question, 0, 4)
 
-	for _, feature := range features {
+	for _, feature := range questions {
 		if _, alreadyAsked := answers[feature.Key]; alreadyAsked {
 			continue
 		}
@@ -587,17 +995,25 @@ func bestQuestion(candidates []Language, answers map[string]Answer) (Feature, bo
 		score := yesCount * noCount
 		if score > bestScore {
 			bestScore = score
-			selected = feature
+			bestFeatures = []Feature{feature}
+		} else if score == bestScore {
+			bestFeatures = append(bestFeatures, feature)
 		}
 	}
 
-	return selected, bestScore >= 0
+	if bestScore < 0 || len(bestFeatures) == 0 {
+		return Question{}, false
+	}
+	if rng == nil || len(bestFeatures) == 1 {
+		return bestFeatures[0], true
+	}
+	return bestFeatures[rng.Intn(len(bestFeatures))], true
 }
 
-func reportSingleGuess(out io.Writer, candidate Language, answers map[string]Answer) {
+func reportSingleGuess(out io.Writer, questions []Question, candidate Entry, answers map[string]Answer) {
 	fmt.Fprintln(out)
 	fmt.Fprintf(out, "たぶん %s です。\n", candidate.Name)
-	if highlights := matchingHighlights(candidate, answers, 4); len(highlights) > 0 {
+	if highlights := matchingHighlights(questions, candidate, answers, 4); len(highlights) > 0 {
 		fmt.Fprintf(out, "根拠: %s\n", strings.Join(highlights, " / "))
 	}
 	fmt.Fprintf(out, "ひとこと: %s\n", candidate.Summary)
@@ -613,11 +1029,14 @@ func reportAmbiguousResult(out io.Writer, candidates []Language) {
 	fmt.Fprintln(out, "正解を学習させると、次回から候補に追加されます。")
 }
 
-func reportNoExactMatch(out io.Writer, candidates []Language, answers map[string]Answer) {
+func reportNoExactMatch(out io.Writer, questions []Question, candidates []Entry, answers map[string]Answer) {
 	fmt.Fprintln(out)
 	fmt.Fprintln(out, "手元のデータでは完全一致が見つかりませんでした。近い候補は次のあたりです。")
 	for _, match := range rankMatches(candidates, answers, 3) {
-		fmt.Fprintf(out, "- %s (%d 一致 / %d 不一致): %s\n", match.Language.Name, match.Matches, match.Mismatches, match.Language.Summary)
+		fmt.Fprintf(out, "- %s (%d/%d 一致, %d 不一致): %s\n", match.Language.Name, match.Matches, match.Coverage, match.Mismatches, match.Language.Summary)
+		if reasons := matchReasons(questions, match.Language, answers, 4); len(reasons) > 0 {
+			fmt.Fprintf(out, "  一致点: %s\n", strings.Join(reasons, " / "))
+		}
 	}
 	fmt.Fprintln(out, "正解を学習させると、次回から候補に追加されます。")
 }
@@ -659,9 +1078,9 @@ func rankMatches(candidates []Language, answers map[string]Answer, limit int) []
 	return matches[:limit]
 }
 
-func matchingHighlights(candidate Language, answers map[string]Answer, limit int) []string {
+func matchingHighlights(questions []Question, candidate Entry, answers map[string]Answer, limit int) []string {
 	labels := make([]string, 0, limit)
-	for _, feature := range features {
+	for _, feature := range questions {
 		if len(labels) >= limit {
 			break
 		}
@@ -670,4 +1089,25 @@ func matchingHighlights(candidate Language, answers map[string]Answer, limit int
 		}
 	}
 	return labels
+}
+
+func matchReasons(questions []Question, candidate Entry, answers map[string]Answer, limit int) []string {
+	reasons := make([]string, 0, limit)
+	for _, feature := range questions {
+		if len(reasons) >= limit {
+			break
+		}
+
+		switch answers[feature.Key] {
+		case Yes:
+			if candidate.Features[feature.Key] {
+				reasons = append(reasons, feature.Label)
+			}
+		case No:
+			if !candidate.Features[feature.Key] {
+				reasons = append(reasons, feature.Label+"ではない")
+			}
+		}
+	}
+	return reasons
 }

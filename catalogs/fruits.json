@@ -1,0 +1,19 @@
+{
+  "id": "fruits",
+  "title": "Guess The Fruit",
+  "intro": "果物について yes / no で答えてください。",
+  "questions": [
+    { "key": "citrus", "label": "柑橘", "prompt": "柑橘系ですか？" },
+    { "key": "tropical", "label": "南国系", "prompt": "南国の果物という印象が強いですか？" },
+    { "key": "red", "label": "赤い", "prompt": "赤い色の印象が強いですか？" },
+    { "key": "peelable", "label": "皮をむく", "prompt": "手で皮をむいて食べる印象が強いですか？" },
+    { "key": "small_berries", "label": "粒が小さい", "prompt": "小さな粒の実として知られていますか？" }
+  ],
+  "entries": [
+    { "name": "Orange", "summary": "代表的な柑橘系の果物です。", "features": ["citrus", "peelable"] },
+    { "name": "Banana", "summary": "皮をむいて食べる南国の果物です。", "features": ["tropical", "peelable"] },
+    { "name": "Apple", "summary": "赤い色でも知られる定番の果物です。", "features": ["red"] },
+    { "name": "Strawberry", "summary": "赤くて小さい実の果物として人気です。", "features": ["red", "small_berries"] },
+    { "name": "Mango", "summary": "南国系の濃厚な甘さで知られる果物です。", "features": ["tropical"] }
+  ]
+}

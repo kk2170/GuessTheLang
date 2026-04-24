@@ -1,0 +1,20 @@
+{
+  "id": "animals",
+  "title": "Guess The Animal",
+  "intro": "動物について yes / no で答えてください。",
+  "questions": [
+    { "key": "barks", "label": "吠える", "prompt": "吠えますか？" },
+    { "key": "meows", "label": "鳴く", "prompt": "よく鳴きますか？" },
+    { "key": "flies", "label": "飛ぶ", "prompt": "飛びますか？" },
+    { "key": "swims", "label": "泳ぐ", "prompt": "泳ぐ印象が強いですか？" },
+    { "key": "farm_animal", "label": "家畜", "prompt": "家畜としてよく知られていますか？" },
+    { "key": "pet", "label": "ペット", "prompt": "ペットとして人気がありますか？" }
+  ],
+  "entries": [
+    { "name": "Dog", "summary": "人になつきやすく、よく吠える動物です。", "features": ["barks", "pet"] },
+    { "name": "Cat", "summary": "よく鳴き、ペットとして人気の高い動物です。", "features": ["meows", "pet"] },
+    { "name": "Eagle", "summary": "空を飛ぶ大型の鳥として知られています。", "features": ["flies"] },
+    { "name": "Dolphin", "summary": "海で泳ぐ知能の高い動物として有名です。", "features": ["swims"] },
+    { "name": "Cow", "summary": "家畜として広く知られる大型の動物です。", "features": ["farm_animal"] }
+  ]
+}
